@@ -39,7 +39,7 @@ chmod +x setup-lex-deepgram-secret.sh diagnose-lex-deepgram-secret.sh
 1. **解析 Lex ARN**：从 bot 或 bot-alias ARN 中自动提取 region、account ID、bot ID。
 2. **准备客户托管 KMS 密钥**：官方要求必须使用**客户托管的对称 KMS 密钥**，默认的 AWS 托管密钥（`aws/secretsmanager`）不被 Lex 支持。脚本通过别名 `alias/lex-deepgram-apitoken` 自动创建或复用密钥（也可用 `--kms-key-id` 指定自有密钥）。
 3. **设置 KMS 密钥策略**：为脚本管理的密钥附加策略，允许 `lex.amazonaws.com` 通过 `secretsmanager.<region>.amazonaws.com` 调用 `kms:Decrypt`（官方文档未提及这一步，是常见漏配点）。
-4. **写入密钥**：按官方要求存储为单个键值对 `{"apiToken":"<你的密钥>"}`。
+4. **写入密钥**：按官方要求存储为键值对 `{"apiToken":"<你的密钥>"}`；若指定了 `--api-token-region`，则写入 `{"apiToken":"<你的密钥>","apiTokenRegion":"<region>"}`，供 Amazon Connect 选择 Deepgram 区域/专属端点。
    - 不存在 → 创建（`create-secret`）
    - 已存在 → 更新密钥值与 KMS 密钥（`update-secret` + `put-secret-value`）
 5. **附加资源策略**：允许 `lex.amazonaws.com` 调用 `secretsmanager:GetSecretValue`，并通过 `aws:SourceAccount` 与 `aws:SourceArn`（收紧到该 bot 的别名 `bot-alias/<botId>/*`）限制范围。
@@ -54,18 +54,55 @@ chmod +x setup-lex-deepgram-secret.sh diagnose-lex-deepgram-secret.sh
   --api-key 'dg_xxxxxxxxxxxxxxxxxxxxxxxx'
 ```
 
+### 交互模式
+
+若在终端（如 CloudShell）中运行时未提供 `--lex-arn` / `--api-key` / `--api-token-region`，脚本会**逐项提示输入**：
+
+- 提示输入 Lex bot / bot-alias ARN；
+- 提示输入 Deepgram API Key（**输入隐藏**，不回显）；
+- 以菜单方式选择 `apiTokenRegion`（1 全球 / 2 `eu` / 3 `au` / 4 专属端点），直接回车默认全球端点。
+
+```bash
+# 直接运行，按提示输入
+./setup-lex-deepgram-secret.sh
+```
+
+> ℹ️ 仅在交互式终端（TTY）下提示。在无 TTY 的自动化场景（CI、管道输入）中不提示，缺少必填项会直接报错退出，以免脚本挂起。
+
 ### 参数
 
 | 参数 | 必填 | 说明 |
 |------|------|------|
 | `--lex-arn` | 是 | Lex V2 的 bot 或 bot-alias ARN |
 | `--api-key` | 是 | Deepgram API Key |
+| `--api-token-region` | 否 | Deepgram `apiTokenRegion`（**仅 Amazon Connect 生效**），用于选择区域/专属端点。不填走全球端点。取值见下表 |
 | `--secret-name` | 否 | 密钥名称，默认 `lex-deepgram-apitoken-<botId>`。**修复已有配置时，必须填 bot 当前指向的密钥名** |
 | `--kms-key-id` | 否 | 自有客户托管对称 KMS 密钥（key id / ARN / `alias/<name>`）。不填则自动创建或复用 |
 | `--region` | 否 | AWS 区域，默认取 ARN 中的区域 |
 | `-h`, `--help` | 否 | 显示帮助 |
 
 > ⚠️ 若使用 `--kms-key-id` 指定自有密钥，脚本**不会**自动修改该密钥策略，仅给出提示——你需自行确保其密钥策略允许 Lex 解密。
+
+### Deepgram 区域端点（`--api-token-region`）
+
+参考 [Amazon Connect — 第三方 STT 端点与区域](https://docs.aws.amazon.com/connect/latest/adminguide/endpoints-regions-third-party-stt.html) 与 [Deepgram — 区域端点](https://developers.deepgram.com/reference/regional-endpoints)。Amazon Connect 通过密钥 JSON 中的 `apiTokenRegion` 选择 Deepgram 端点：
+
+| `apiTokenRegion` | 端点 | 说明 |
+|------|------|------|
+| （不填） | `https://api.deepgram.com` | 默认全球端点 |
+| `eu` | `https://api.eu.deepgram.com` | 欧盟（**仅支持语音转文字 STT**） |
+| `au` | `https://api.au.deepgram.com` | 澳大利亚 |
+| `<SHORT_UID>.<REGION_SUBDOMAIN>` | `https://<SHORT_UID>.<REGION_SUBDOMAIN>.api.deepgram.com` | Deepgram Dedicated 专属端点 |
+
+> ⚠️ **`apiTokenRegion` 仅对 Amazon Connect 生效。** Amazon Lex V2 不支持该字段：Lex 会按部署所在的 AWS 区域自动选择端点（`eu-` 前缀区域走 `api.eu.deepgram.com`，其余走 `api.deepgram.com`），写入该字段也会被 Lex 忽略。
+
+```bash
+# Amazon Connect，固定走欧盟端点
+./setup-lex-deepgram-secret.sh \
+  --lex-arn arn:aws:lex:eu-west-1:991727053196:bot-alias/E9LXXC9XGT/TSTALIASID \
+  --api-key 'dg_xxxxxxxxxxxxxxxxxxxxxxxx' \
+  --api-token-region eu
+```
 
 ### 在 Lex 控制台关联
 
@@ -150,7 +187,7 @@ aws secretsmanager list-secrets --region us-west-2 \
 | Lex 读不到密钥但策略看似正确 | 确认资源策略 `aws:SourceArn` 覆盖 `bot-alias/<botId>/*`，账号正确 |
 | 解密失败 | 必须客户托管对称 KMS 密钥，且密钥策略允许 Lex 解密 |
 | 密钥内容错误 | 值必须为 `{"apiToken":"..."}`，键名必须是 `apiToken` |
-| 区域端点 | `eu-` 前缀区域走 `api.eu.deepgram.com`，其余走 `api.deepgram.com`；同一 Key 通用 |
+| 区域端点 | Lex V2：`eu-` 前缀区域走 `api.eu.deepgram.com`，其余走 `api.deepgram.com`。Amazon Connect：用 `--api-token-region`（`eu`/`au`/专属端点）显式指定；同一 Key 通用 |
 
 ---
 
@@ -164,5 +201,8 @@ aws secretsmanager list-secrets --region us-west-2 \
 ## 参考来源
 
 - AWS — Setting up Deepgram speech model preference: https://docs.aws.amazon.com/lexv2/latest/dg/customizing-speech-deepgram-setup.html
+- AWS — Endpoints and Regions for third-party STT providers (Amazon Connect): https://docs.aws.amazon.com/connect/latest/adminguide/endpoints-regions-third-party-stt.html
 - AWS — DeepgramSpeechModelConfig API: https://docs.aws.amazon.com/lexv2/latest/APIReference/API_DeepgramSpeechModelConfig.html
+- Deepgram — Regional Endpoints: https://developers.deepgram.com/reference/regional-endpoints
+- Deepgram — Deployment Options: https://developers.deepgram.com/docs/deployment-options
 - Deepgram — Models & Languages Overview: https://developers.deepgram.com/docs/models-languages-overview
